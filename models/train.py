@@ -8,10 +8,13 @@ from darts.dataprocessing.transformers import Scaler
 from darts.metrics import mape, mae, rmse
 from pathlib import Path
 import logging
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 import warnings
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
+from sklearn.model_selection import TimeSeriesSplit
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
 # Import our data loader
 from data.data_loader import load_and_prepare_data
@@ -81,47 +84,49 @@ def scale_features(data: pd.DataFrame) -> Tuple[pd.DataFrame, MinMaxScaler]:
     return scaled_data, scaler
 
 def create_time_series(data: pd.DataFrame) -> TimeSeries:
-    """Convert DataFrame to Darts TimeSeries with validation."""
-    # Ensure the index is datetime
-    if not isinstance(data.index, pd.DatetimeIndex):
-        data.index = pd.to_datetime(data.index)
+    """
+    Create a Darts TimeSeries object from a DataFrame.
     
-    # Validate data before creating TimeSeries
-    validate_data(data, "TimeSeries input")
-    
-    # Log/check here
-    logger.info(f"Data index frequency: {data.index.freq}")
-    logger.info(f"Data index contains {len(data)} points from {data.index[0]} to {data.index[-1]}")
-    
-    # Convert Close price to float32
-    close_data = data[['Close']].astype(np.float32)
-    
-    # Create TimeSeries with only the 'Close' column
-    # Use fill_missing_dates=False to prevent NaN creation
-    series = TimeSeries.from_dataframe(
-        close_data,
-        fill_missing_dates=False, 
-        freq='B'  # Business day frequency
-    )
-    
-    # Validate the created TimeSeries by converting to pandas and checking
-    series_df = series.pd_dataframe()
-    if series_df.isna().sum().sum() > 0:
-        logger.error("NaN values found in TimeSeries after creation")
-        logger.error("First few rows with NaN values:")
-        nan_rows = series_df[series_df.isna().any(axis=1)]
-        logger.error(nan_rows.head())
-        raise ValueError("TimeSeries contains NaN values after creation")
-    
-    # Check for infinite values
-    if np.isinf(series_df.values).sum() > 0:
-        logger.error("Infinite values found in TimeSeries after creation")
-        logger.error("First few rows with infinite values:")
-        inf_rows = series_df[np.isinf(series_df.values).any(axis=1)]
-        logger.error(inf_rows.head())
-        raise ValueError("TimeSeries contains infinite values after creation")
-    
-    return series
+    Args:
+        data: DataFrame with datetime index and features
+        
+    Returns:
+        TimeSeries object
+    """
+    try:
+        # Ensure the index is datetime
+        if not isinstance(data.index, pd.DatetimeIndex):
+            raise ValueError("DataFrame must have a datetime index")
+            
+        # Create a copy of the data with the index as a column
+        df = data.copy()
+        df['time'] = df.index
+        
+        # Convert Close price to float32
+        df['Close'] = df['Close'].astype('float32')
+        
+        # Create TimeSeries object
+        series = TimeSeries.from_dataframe(
+            df,
+            time_col='time',
+            value_cols=['Close'],
+            fill_missing_dates=True,
+            freq='B'  # Business day frequency
+        )
+        
+        # Validate the series
+        if len(series) == 0:
+            raise ValueError("Created TimeSeries is empty")
+            
+        logger.info(f"Created TimeSeries with {len(series)} time steps")
+        logger.info(f"Time range: {series.time_index[0]} to {series.time_index[-1]}")
+        logger.info(f"Frequency: {series.freq}")
+        
+        return series
+        
+    except Exception as e:
+        logger.error(f"Error creating TimeSeries: {str(e)}")
+        raise
 
 def plot_training_data(train_series: TimeSeries, val_series: TimeSeries) -> None:
     """Plot training and validation data for visual inspection."""
@@ -180,155 +185,180 @@ def validate_predictions(predictions: TimeSeries, actual: TimeSeries) -> None:
     if abs(actual_max) > 10 or abs(actual_min) > 10:
         logger.warning(f"Actual values contain extreme values: min={actual_min:.2f}, max={actual_max:.2f}")
 
-def train_model(ticker: str = 'AAPL', 
-                epochs: int = 10,
-                model_params: Dict[str, Any] = None) -> TFTModel:
+def initialize_model(model_params: Dict) -> TFTModel:
     """
-    Train a TFT model on the specified ticker data.
+    Initialize the TFT model with the given parameters.
     
     Args:
-        ticker (str): Stock ticker symbol
-        epochs (int): Number of training epochs
-        model_params (dict): Optional model parameters
+        model_params: Dictionary of model parameters
         
     Returns:
-        TFTModel: Trained model
+        Initialized TFT model
     """
     try:
-        logger.info(f"Loading and preparing data for {ticker}...")
-        train_data, val_data = load_and_prepare_data(ticker)
-        
-        # Log original data statistics
-        logger.info("\nOriginal data statistics:")
-        logger.info(f"Training data range: [{train_data['Close'].min():.2f}, {train_data['Close'].max():.2f}]")
-        logger.info(f"Validation data range: [{val_data['Close'].min():.2f}, {val_data['Close'].max():.2f}]")
-        
-        # Validate and scale the data
-        train_data, train_scaler = scale_features(train_data)
-        val_data, val_scaler = scale_features(val_data)
-        
-        # Validate data
-        validate_data(train_data, "Training")
-        validate_data(val_data, "Validation")
-        
-        logger.info(f"Training data shape: {train_data.shape}")
-        logger.info(f"Validation data shape: {val_data.shape}")
-        
-        # Convert to Darts TimeSeries
-        train_series = create_time_series(train_data)
-        val_series = create_time_series(val_data)
-        
-        # Plot the data for visual inspection
-        plot_training_data(train_series, val_series)
-        
-        # Log data ranges
-        logger.info(f"Training data range: {train_series.time_index[0]} to {train_series.time_index[-1]}")
-        logger.info(f"Validation data range: {val_series.time_index[0]} to {val_series.time_index[-1]}")
-        
-        # Default model parameters with very conservative settings
-        default_params = {
-            'input_chunk_length': 30,
-            'output_chunk_length': 7,
-            'hidden_size': 8,  # Very small for stability
-            'lstm_layers': 1,
-            'num_attention_heads': 1,
-            'dropout': 0.05,   # Minimal dropout
-            'batch_size': 8,   # Very small batch size
-            'n_epochs': epochs,
-            'add_relative_index': True,
-            'add_encoders': {
-                'datetime_attribute': {
-                    'past': ['dayofweek', 'month']
-                },
-                'position': {
-                    'past': ['relative']
-                },
-                'custom': {},
-                'cyclic': {}
-            },
-            'pl_trainer_kwargs': {
-                "accelerator": "cpu",
-                "enable_progress_bar": True,
-                "enable_model_summary": True,
-                "max_epochs": epochs,
-                "precision": "32-true",  # Ensure float32 precision
-                "gradient_clip_val": 0.01,  # Very aggressive gradient clipping
-                "accumulate_grad_batches": 8,  # Increased for stability
-                "deterministic": True,
-                "devices": 1,
-                "strategy": "auto",
-                "check_val_every_n_epoch": 1,  # Check validation more frequently
-                "log_every_n_steps": 1  # Log more frequently
-            },
-            'optimizer_kwargs': {
-                'lr': 1e-4,  # Very small learning rate
-                'weight_decay': 1e-6,  # Minimal weight decay
-                'eps': 1e-7  # Increased epsilon
-            }
+        logger.info("\nInitializing TFT model with parameters:")
+        for key, value in model_params.items():
+            logger.info(f"{key}: {value}")
+            
+        # Corrected add_encoders structure
+        add_encoders = {
+            'datetime_attribute': {'past': ['dayofweek', 'month']},
+            'position': {'past': ['relative']},
         }
         
-        # Update with custom parameters if provided
-        if model_params:
-            default_params.update(model_params)
-        
-        logger.info("\nInitializing TFT model with parameters:")
-        for key, value in default_params.items():
-            if key != 'pl_trainer_kwargs' and key != 'optimizer_kwargs':
-                logger.info(f"{key}: {value}")
-        
-        model = TFTModel(**default_params)
-        
-        logger.info("\nTraining model...")
-        model.fit(
-            series=train_series,
-            val_series=val_series,
-            verbose=True
-        )
-        
-        # Evaluate model
-        logger.info("\nEvaluating model...")
-        predictions = model.predict(n=len(val_series))
-        
-        # Validate predictions
-        validate_predictions(predictions, val_series)
-        
-        # Calculate metrics
-        try:
-            mape_value = mape(val_series, predictions)
-            mae_value = mae(val_series, predictions)
-            rmse_value = rmse(val_series, predictions)
-            
-            metrics = {
-                'MAPE': mape_value,
-                'MAE': mae_value,
-                'RMSE': rmse_value
+        # Initialize model
+        model = TFTModel(
+            input_chunk_length=model_params['input_chunk_length'],
+            output_chunk_length=model_params['output_chunk_length'],
+            hidden_size=model_params['hidden_size'],
+            lstm_layers=model_params['lstm_layers'],
+            num_attention_heads=model_params['num_attention_heads'],
+            dropout=model_params['dropout'],
+            batch_size=model_params['batch_size'],
+            n_epochs=model_params['n_epochs'],
+            add_relative_index=model_params['add_relative_index'],
+            add_encoders=add_encoders,
+            random_state=42,
+            pl_trainer_kwargs={
+                'accelerator': 'cpu',  # Use CPU instead of MPS
+                'devices': 1,
+                'precision': '32-true'  # Force float32 precision
             }
-            
-            logger.info("\nModel metrics:")
-            for metric, value in metrics.items():
-                logger.info(f"{metric}: {value:.2f}")
-        except Exception as e:
-            logger.error(f"\nError calculating metrics: {str(e)}")
-            logger.error("Raw predictions and actual values:")
-            logger.error(f"Predictions: {predictions.values()}")
-            logger.error(f"Actual: {val_series.values()}")
-        
-        # Create models directory if it doesn't exist
-        models_dir = Path('models')
-        models_dir.mkdir(exist_ok=True)
-        
-        # Save model
-        model_path = str(models_dir / f"{ticker}_tft_model.pt")
-        model.save(model_path)
-        logger.info(f"\nModel saved to {model_path}")
+        )
         
         return model
         
     except Exception as e:
-        logger.error(f"\nError during model training: {str(e)}")
+        logger.error(f"Error initializing model: {str(e)}")
+        raise
+
+def cross_validate_model(data: pd.DataFrame, model_params: Dict, n_splits: int = 5) -> Dict:
+    """
+    Perform time series cross-validation.
+    
+    Args:
+        data: DataFrame containing the data
+        model_params: Dictionary of model parameters
+        n_splits: Number of splits for cross-validation
+        
+    Returns:
+        Dictionary containing cross-validation metrics
+    """
+    try:
+        logger.info("\nPerforming cross-validation...")
+        
+        # Initialize cross-validation
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        metrics = []
+        
+        # Perform cross-validation
+        for train_idx, val_idx in tscv.split(data):
+            # Split data
+            train_data = data.iloc[train_idx]
+            val_data = data.iloc[val_idx]
+            
+            # Create TimeSeries objects
+            train_series = create_time_series(train_data)
+            val_series = create_time_series(val_data)
+            
+            # Initialize and train model
+            model = initialize_model(model_params)
+            model.fit(train_series)
+            
+            # Generate predictions
+            predictions = model.predict(n=len(val_series))
+            
+            # Calculate metrics
+            fold_metrics = {
+                'mape': mape(val_series, predictions),
+                'mae': mae(val_series, predictions),
+                'rmse': rmse(val_series, predictions)
+            }
+            
+            metrics.append(fold_metrics)
+            
+        # Calculate average metrics
+        avg_metrics = {
+            'mape': np.mean([m['mape'] for m in metrics]),
+            'mae': np.mean([m['mae'] for m in metrics]),
+            'rmse': np.mean([m['rmse'] for m in metrics])
+        }
+        
+        logger.info("\nCross-validation metrics:")
+        for metric, value in avg_metrics.items():
+            logger.info(f"{metric.upper()}: {value:.4f}")
+            
+        return avg_metrics
+        
+    except Exception as e:
+        logger.error(f"Error in cross-validation: {str(e)}")
+        raise
+
+def train_model(ticker: str) -> TFTModel:
+    """
+    Train the TFT model on the given ticker data.
+    
+    Args:
+        ticker: Stock ticker symbol
+        
+    Returns:
+        Trained TFT model
+    """
+    try:
+        # Load and prepare data
+        train_data, val_data = load_and_prepare_data(ticker)
+        
+        # Define model parameters
+        model_params = {
+            'input_chunk_length': 30,
+            'output_chunk_length': 7,
+            'hidden_size': 16,
+            'lstm_layers': 1,
+            'num_attention_heads': 1,
+            'dropout': 0.05,
+            'batch_size': 8,
+            'n_epochs': 5,
+            'add_relative_index': True
+        }
+        
+        # Perform cross-validation
+        cv_metrics = cross_validate_model(train_data, model_params)
+        
+        # Create TimeSeries objects for final training
+        train_series = create_time_series(train_data)
+        val_series = create_time_series(val_data)
+        
+        # Initialize and train final model
+        model = initialize_model(model_params)
+        model.fit(train_series)
+        
+        # Generate predictions
+        predictions = model.predict(n=len(val_series))
+        
+        # Calculate final metrics
+        final_metrics = {
+            'mape': mape(val_series, predictions),
+            'mae': mae(val_series, predictions),
+            'rmse': rmse(val_series, predictions)
+        }
+        
+        logger.info("\nFinal model metrics:")
+        for metric, value in final_metrics.items():
+            logger.info(f"{metric.upper()}: {value:.4f}")
+        
+        return model
+        
+    except Exception as e:
+        logger.error(f"Error training model: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    # Train model with default parameters
-    model = train_model(epochs=5)
-    print("\nModel training completed!")
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Train model
+    model = train_model('AAPL')
+    logger.info("\nModel training completed!")

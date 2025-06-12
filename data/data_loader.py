@@ -1,9 +1,16 @@
 import pandas as pd
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import logging
 import numpy as np
+from alpha_vantage.timeseries import TimeSeries
+from sklearn.preprocessing import MinMaxScaler
+import talib
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -111,6 +118,44 @@ class DataLoader:
         rs = gain / loss
         data['RSI'] = 100 - (100 / (1 + rs))
         
+        # Calculate MACD
+        macd, macd_signal, macd_hist = talib.MACD(data['Close'].values)
+        data['MACD'] = macd
+        data['MACD_Signal'] = macd_signal
+        data['MACD_Hist'] = macd_hist
+        
+        # Calculate Bollinger Bands
+        upper, middle, lower = talib.BBANDS(data['Close'].values, timeperiod=20)
+        data['BB_Upper'] = upper
+        data['BB_Middle'] = middle
+        data['BB_Lower'] = lower
+        
+        # Calculate Stochastic Oscillator
+        slowk, slowd = talib.STOCH(data['High'].values, data['Low'].values, data['Close'].values)
+        data['Stoch_K'] = slowk
+        data['Stoch_D'] = slowd
+        
+        # Calculate ADX (Average Directional Index)
+        data['ADX'] = talib.ADX(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate ATR (Average True Range)
+        data['ATR'] = talib.ATR(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate OBV (On Balance Volume)
+        data['OBV'] = talib.OBV(data['Close'].values, data['Volume'].values)
+        
+        # Calculate Williams %R
+        data['Williams_R'] = talib.WILLR(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate CCI (Commodity Channel Index)
+        data['CCI'] = talib.CCI(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate ROC (Rate of Change)
+        data['ROC'] = talib.ROC(data['Close'].values, timeperiod=10)
+        
+        # Calculate MOM (Momentum)
+        data['MOM'] = talib.MOM(data['Close'].values, timeperiod=10)
+        
         # Fill any remaining NaN values with appropriate methods
         data['Returns'] = data['Returns'].fillna(0)  # First day return is 0
         data['Volatility'] = data['Volatility'].fillna(0)  # First days volatility is 0
@@ -126,22 +171,186 @@ class DataLoader:
         logger.info(f"Date range: {data.index[0]} to {data.index[-1]}")
         logger.info(f"Number of business days: {len(data)}")
         
-        return data
+        # Scale features
+        scaler = MinMaxScaler(feature_range=(-1, 1))
+        data_scaled = pd.DataFrame(
+            scaler.fit_transform(data),
+            index=data.index,
+            columns=data.columns
+        )
+        
+        return data_scaled
 
-def load_and_prepare_data(ticker: str, 
-                         train_ratio: float = 0.8) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_and_prepare_data(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Convenience function to load and prepare data for a ticker.
+    Load and prepare data for a given ticker.
     
     Args:
-        ticker (str): Stock ticker symbol
-        train_ratio (float): Ratio of data to use for training
+        ticker: Stock ticker symbol
         
     Returns:
-        Tuple[pd.DataFrame, pd.DataFrame]: Prepared training and validation sets
+        Tuple of (training_data, validation_data)
     """
-    loader = DataLoader()
-    data = loader.load_ticker_data(ticker)
-    data = loader.prepare_features(data)
-    train_data, val_data = loader.get_train_val_split(data, train_ratio)
-    return train_data, val_data
+    try:
+        # Load data
+        logger.info(f"Loading and preparing data for {ticker}...")
+        api_key = os.getenv('ALPHA_VANTAGE_API_KEY')
+        if not api_key:
+            raise ValueError("ALPHA_VANTAGE_API_KEY not found in environment variables")
+            
+        ts = TimeSeries(key=api_key, output_format='pandas')
+        data, _ = ts.get_daily(symbol=ticker, outputsize='full')
+        
+        # Check if data is empty
+        if data.empty:
+            raise ValueError(f"No data received for ticker {ticker}")
+            
+        # Rename columns to match expected format
+        data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        
+        # Sort by date in ascending order
+        data = data.sort_index()
+        
+        # Filter to last 5 years of data
+        end_date = data.index[-1]
+        start_date = end_date - pd.DateOffset(years=5)
+        data = data[start_date:end_date]
+        
+        logger.info(f"Loaded {len(data)} rows of data for {ticker}")
+        logger.info(f"Date range: {data.index[0]} to {data.index[-1]}")
+        
+        # Create continuous business day index
+        business_days = pd.date_range(start=data.index[0], end=data.index[-1], freq='B')
+        data = data.reindex(business_days)
+        
+        # Forward fill missing values for OHLCV data
+        data[['Open', 'High', 'Low', 'Close', 'Volume']] = data[['Open', 'High', 'Low', 'Close', 'Volume']].fillna(method='ffill')
+        
+        # Prepare features
+        data = prepare_features(data)
+        
+        if data.empty:
+            raise ValueError("No data remaining after feature preparation")
+            
+        logger.info(f"After feature preparation: {len(data)} rows")
+        logger.info(f"Number of business days: {len(data)}")
+        
+        # Split data
+        train_data, val_data = get_train_val_split(data)
+        logger.info(f"Split data into {len(train_data)} training and {len(val_data)} validation samples")
+        
+        return train_data, val_data
+        
+    except Exception as e:
+        logger.error(f"Error loading data: {str(e)}")
+        raise
+
+def prepare_features(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare features for the model.
+    
+    Args:
+        data: DataFrame containing OHLCV data
+        
+    Returns:
+        DataFrame with additional features
+    """
+    try:
+        # Make a copy to avoid modifying the original
+        data = data.copy()
+        
+        # Calculate returns
+        data['Returns'] = data['Close'].pct_change()
+        
+        # Calculate volatility
+        data['Volatility'] = data['Returns'].rolling(window=20, min_periods=1).std()
+        
+        # Calculate RSI
+        data['RSI'] = talib.RSI(data['Close'].values, timeperiod=14)
+        
+        # Calculate MACD
+        macd, macd_signal, macd_hist = talib.MACD(data['Close'].values)
+        data['MACD'] = macd
+        data['MACD_Signal'] = macd_signal
+        data['MACD_Hist'] = macd_hist
+        
+        # Calculate Bollinger Bands
+        upper, middle, lower = talib.BBANDS(data['Close'].values, timeperiod=20)
+        data['BB_Upper'] = upper
+        data['BB_Middle'] = middle
+        data['BB_Lower'] = lower
+        
+        # Calculate Stochastic Oscillator
+        slowk, slowd = talib.STOCH(data['High'].values, data['Low'].values, data['Close'].values)
+        data['Stoch_K'] = slowk
+        data['Stoch_D'] = slowd
+        
+        # Calculate ADX (Average Directional Index)
+        data['ADX'] = talib.ADX(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate ATR (Average True Range)
+        data['ATR'] = talib.ATR(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate OBV (On Balance Volume)
+        data['OBV'] = talib.OBV(data['Close'].values, data['Volume'].values)
+        
+        # Calculate Williams %R
+        data['Williams_R'] = talib.WILLR(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate CCI (Commodity Channel Index)
+        data['CCI'] = talib.CCI(data['High'].values, data['Low'].values, data['Close'].values, timeperiod=14)
+        
+        # Calculate ROC (Rate of Change)
+        data['ROC'] = talib.ROC(data['Close'].values, timeperiod=10)
+        
+        # Calculate MOM (Momentum)
+        data['MOM'] = talib.MOM(data['Close'].values, timeperiod=10)
+        
+        # Fill any remaining NaN values with appropriate methods
+        data = data.fillna(method='ffill').fillna(method='bfill')
+        
+        # Check if we have any data left after feature preparation
+        if len(data) == 0:
+            raise ValueError("No data remaining after feature preparation")
+            
+        # Scale features
+        scaler = MinMaxScaler(feature_range=(-1, 1))
+        data_scaled = pd.DataFrame(
+            scaler.fit_transform(data),
+            index=data.index,
+            columns=data.columns
+        )
+        
+        return data_scaled
+        
+    except Exception as e:
+        logger.error(f"Error preparing features: {str(e)}")
+        raise
+
+def get_train_val_split(data: pd.DataFrame, val_size: float = 0.2) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split data into training and validation sets.
+    
+    Args:
+        data: DataFrame containing the data
+        val_size: Size of validation set as a fraction of total data
+        
+    Returns:
+        Tuple of (training_data, validation_data)
+    """
+    try:
+        if len(data) == 0:
+            raise ValueError("Cannot split empty dataset")
+            
+        split_idx = int(len(data) * (1 - val_size))
+        train_data = data[:split_idx]
+        val_data = data[split_idx:]
+        
+        if len(train_data) == 0 or len(val_data) == 0:
+            raise ValueError("Split resulted in empty training or validation set")
+            
+        return train_data, val_data
+        
+    except Exception as e:
+        logger.error(f"Error splitting data: {str(e)}")
+        raise
