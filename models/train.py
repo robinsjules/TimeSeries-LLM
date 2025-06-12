@@ -294,12 +294,14 @@ def cross_validate_model(data: pd.DataFrame, model_params: Dict, n_splits: int =
         logger.error(f"Error in cross-validation: {str(e)}")
         raise
 
-def train_model(ticker: str) -> TFTModel:
+def train_model(ticker: str, epochs: int = 5, model_params: Dict = None) -> TFTModel:
     """
     Train the TFT model on the given ticker data.
     
     Args:
         ticker: Stock ticker symbol
+        epochs: Number of training epochs
+        model_params: Dictionary of model parameters (optional)
         
     Returns:
         Trained TFT model
@@ -308,8 +310,8 @@ def train_model(ticker: str) -> TFTModel:
         # Load and prepare data
         train_data, val_data = load_and_prepare_data(ticker)
         
-        # Define model parameters
-        model_params = {
+        # Define default model parameters
+        default_params = {
             'input_chunk_length': 30,
             'output_chunk_length': 7,
             'hidden_size': 16,
@@ -317,19 +319,23 @@ def train_model(ticker: str) -> TFTModel:
             'num_attention_heads': 1,
             'dropout': 0.05,
             'batch_size': 8,
-            'n_epochs': 5,
+            'n_epochs': epochs,
             'add_relative_index': True
         }
         
+        # Update default parameters with any provided parameters
+        if model_params:
+            default_params.update(model_params)
+        
         # Perform cross-validation
-        cv_metrics = cross_validate_model(train_data, model_params)
+        cv_metrics = cross_validate_model(train_data, default_params)
         
         # Create TimeSeries objects for final training
         train_series = create_time_series(train_data)
         val_series = create_time_series(val_data)
         
         # Initialize and train final model
-        model = initialize_model(model_params)
+        model = initialize_model(default_params)
         model.fit(train_series)
         
         # Generate predictions

@@ -266,3 +266,32 @@ def run_backtest(signals: pd.DataFrame,
     except Exception as e:
         logger.error(f"Error running backtest: {str(e)}")
         raise
+
+def generate_signals(predictions: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
+    """
+    Generate trading signals based on predictions.
+    
+    Args:
+        predictions: DataFrame containing price predictions
+        threshold: Threshold for signal generation
+        
+    Returns:
+        DataFrame containing trading signals
+    """
+    try:
+        # Create signals DataFrame
+        signals = pd.DataFrame(index=predictions.index)
+        signals['signal'] = 0
+        
+        # Calculate price changes
+        price_changes = predictions['Close'].pct_change()
+        
+        # Generate signals based on price changes and threshold
+        signals.loc[price_changes > threshold, 'signal'] = 1  # Buy signal
+        signals.loc[price_changes < -threshold, 'signal'] = -1  # Sell signal
+        
+        return signals
+        
+    except Exception as e:
+        logger.error(f"Error generating signals: {str(e)}")
+        raise
