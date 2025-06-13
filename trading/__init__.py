@@ -1,3 +1,3 @@
 """
-Trading strategy and backtesting module.
+Trading strategies and backtesting package
 """ 

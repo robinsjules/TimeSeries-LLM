@@ -1,3 +1,3 @@
 """
-LLM-based insights generation module.
+LLM-powered insights generation package
 """ 

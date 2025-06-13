@@ -1,3 +1,3 @@
 """
-Model training and prediction module.
+Time series prediction models package
 """ 
